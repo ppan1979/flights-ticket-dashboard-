@@ -97,13 +97,15 @@ def create_task(
     return task_id
 
 
-def save_price(task_id: str, airline: str, price_twd: int, layover_info: str):
+def save_price(task_id: str, flights: list):
+    """Save a list of flight dicts [{airline, price_twd, layover_info}, ...]."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO price_history (task_id, checked_at, airline, price_twd, layover_info) VALUES (?, ?, ?, ?, ?)",
-            (task_id, now, airline, price_twd, layover_info)
-        )
+        for f in flights:
+            conn.execute(
+                "INSERT INTO price_history (task_id, checked_at, airline, price_twd, layover_info) VALUES (?, ?, ?, ?, ?)",
+                (task_id, now, f["airline"], f["price_twd"], f["layover_info"])
+            )
         conn.execute(
             "UPDATE tasks SET last_checked = ? WHERE task_id = ?",
             (now, task_id)
@@ -116,13 +118,27 @@ def get_all_tasks():
         return conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
 
 
-def get_latest_two_prices(task_id: str):
+def get_latest_prices(task_id: str):
+    """Return all rows from the two most recent checked_at timestamps."""
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM price_history WHERE task_id = ? ORDER BY checked_at DESC LIMIT 2",
+        ts_rows = conn.execute(
+            "SELECT DISTINCT checked_at FROM price_history WHERE task_id = ? ORDER BY checked_at DESC LIMIT 2",
             (task_id,)
         ).fetchall()
-    return rows
+        if not ts_rows:
+            return [], []
+        latest_ts = ts_rows[0][0]
+        prev_ts = ts_rows[1][0] if len(ts_rows) > 1 else None
+
+        latest = conn.execute(
+            "SELECT * FROM price_history WHERE task_id = ? AND checked_at = ? ORDER BY price_twd ASC",
+            (task_id, latest_ts)
+        ).fetchall()
+        prev = conn.execute(
+            "SELECT * FROM price_history WHERE task_id = ? AND checked_at = ? ORDER BY price_twd ASC",
+            (task_id, prev_ts)
+        ).fetchall() if prev_ts else []
+    return latest, prev
 
 
 def get_task(task_id: str):
@@ -175,7 +191,7 @@ async def fetch_flight_data(
     Headless Chromium scraper targeting Google Flights.
     Falls back to simulated data if scraping fails.
     """
-    result = {"airline": "N/A", "price_twd": 0, "layover_info": "N/A"}
+    result = {"airline": "N/A", "price_twd": 0, "layover_info": "N/A"}  # single best from scrape
 
     if trip_type == "roundtrip" and return_date:
         clean_url = (
@@ -274,9 +290,10 @@ async def fetch_flight_data(
 
     except Exception as exc:
         st.warning(f"爬蟲發生錯誤（{exc}），使用模擬資料示範流程。")
-        result = _simulate_flight_data(origin, destination, trip_type)
+        return _simulate_flight_data(origin, destination, trip_type)
 
-    return result
+    # Wrap single scraped result in list for consistent interface
+    return [result] if result["price_twd"] > 0 else _simulate_flight_data(origin, destination, trip_type)
 
 
 def _parse_layover(raw: Optional[str]) -> str:
@@ -288,8 +305,13 @@ def _parse_layover(raw: Optional[str]) -> str:
     return raw.strip()
 
 
-def _simulate_flight_data(origin: str, destination: str, trip_type: str = "oneway") -> dict:
-    airlines = ["中華航空", "長榮航空", "國泰航空", "日本航空", "新加坡航空"]
+def _simulate_flight_data(origin: str, destination: str, trip_type: str = "oneway") -> list:
+    """Return multiple airline options for display, sorted by price."""
+    airlines_pool = [
+        ("中華航空", "CI"), ("長榮航空", "BR"), ("國泰航空", "CX"),
+        ("日本航空", "JL"), ("新加坡航空", "SQ"), ("泰國航空", "TG"),
+        ("馬來西亞航空", "MH"), ("全日空", "NH"),
+    ]
     base_prices = {
         ("TPE", "NRT"): 8500,  ("TPE", "HKG"): 4200,
         ("TPE", "SIN"): 11000, ("TPE", "BKK"): 9800,
@@ -297,20 +319,28 @@ def _simulate_flight_data(origin: str, destination: str, trip_type: str = "onewa
     }
     layovers = [
         "直飛",
+        "直飛",
         "1次 (HKG / 1小時30分)",
         "1次 (NRT / 2小時)",
         "2次 (HKG / 1小時, SIN / 3小時)",
     ]
     key = (origin.upper(), destination.upper())
     base = base_prices.get(key, 15000)
-    # Round-trip price roughly doubles with small discount
     multiplier = 1.85 if trip_type == "roundtrip" else 1.0
-    price = int((base + random.randint(-2000, 2000)) * multiplier)
-    return {
-        "airline": random.choice(airlines),
-        "price_twd": price,
-        "layover_info": random.choice(layovers),
-    }
+
+    # Pick 4~6 random airlines with slightly different prices
+    sample = random.sample(airlines_pool, k=random.randint(4, 6))
+    results = []
+    for name, _ in sample:
+        price = int((base + random.randint(-3000, 5000)) * multiplier)
+        results.append({
+            "airline": name,
+            "price_twd": price,
+            "layover_info": random.choice(layovers),
+        })
+    # Sort cheapest first
+    results.sort(key=lambda x: x["price_twd"])
+    return results
 
 
 def run_fetch_for_task(task_id: str):
@@ -330,8 +360,8 @@ def run_fetch_for_task(task_id: str):
         )
     finally:
         loop.close()
-    if data and data["price_twd"] > 0:
-        save_price(task_id, data["airline"], data["price_twd"], data["layover_info"])
+    if data:
+        save_price(task_id, data)
 
 
 # =============================================================================
@@ -370,14 +400,17 @@ def build_dashboard_df() -> pd.DataFrame:
     rows = []
     for task in get_all_tasks():
         tid = task["task_id"]
-        prices = get_latest_two_prices(tid)
+        prices = get_latest_prices(tid)   # returns (latest_list, prev_list)
         trip_type = task["trip_type"] if task["trip_type"] else "oneway"
         trip_label = "來回" if trip_type == "roundtrip" else "單程"
 
-        if not prices:
+        latest_list, prev_list = prices
+        route = f"{task['origin']} → {task['destination']}"
+
+        if not latest_list:
             rows.append({
                 "task_id": tid,
-                "航線": f"{task['origin']} → {task['destination']}",
+                "航線": route,
                 "行程類型": trip_label,
                 "出發日期": task["depart_date"] or "-",
                 "回程日期": task["return_date"] or "-",
@@ -390,25 +423,28 @@ def build_dashboard_df() -> pd.DataFrame:
             })
             continue
 
-        latest = prices[0]
-        prev = prices[1] if len(prices) > 1 else None
-        prev_price = prev["price_twd"] if prev else None
-        delta = (latest["price_twd"] - prev_price) if prev_price is not None else None
+        # Cheapest of latest batch
+        best = latest_list[0]
+        # Cheapest of previous batch
+        prev_best_price = prev_list[0]["price_twd"] if prev_list else None
+        delta = (best["price_twd"] - prev_best_price) if prev_best_price is not None else None
+
+        # All airlines this round
+        airlines_str = " / ".join(f["airline"] for f in latest_list)
 
         rows.append({
             "task_id": tid,
-            "航線": f"{task['origin']} → {task['destination']}",
+            "航線": route,
             "行程類型": trip_label,
             "出發日期": task["depart_date"] or "-",
             "回程日期": task["return_date"] or "-",
-            "航空公司": latest["airline"] or "-",
-            "轉機資訊": latest["layover_info"] or "-",
-            "最新價格 (TWD)": latest["price_twd"],
-            "上次價格 (TWD)": prev_price,
+            "航空公司": airlines_str,
+            "轉機資訊": best["layover_info"] or "-",
+            "最新價格 (TWD)": best["price_twd"],
+            "上次價格 (TWD)": prev_best_price,
             "變動幅度": delta,
-            "智能評論": price_comment(latest["price_twd"], prev_price),
+            "智能評論": price_comment(best["price_twd"], prev_best_price),
         })
-
     return pd.DataFrame(rows)
 
 
@@ -504,36 +540,41 @@ def main():
     with st.sidebar:
         st.header("➕ 新增監控任務")
 
+        # trip_type OUTSIDE form so radio change triggers immediate rerun
+        # and return_date disabled state updates instantly
+        trip_type = st.radio(
+            "行程類型",
+            options=["oneway", "roundtrip"],
+            format_func=lambda x: "單程" if x == "oneway" else "來回",
+            horizontal=True,
+            key="trip_type_radio",
+        )
+
+        today = date.today()
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            depart_date = st.date_input(
+                "出發日期",
+                value=today + timedelta(days=30),
+                min_value=today,
+                key="depart_date_input",
+            )
+        with col_d2:
+            return_date = st.date_input(
+                "回程日期",
+                value=today + timedelta(days=37),
+                min_value=depart_date + timedelta(days=1),
+                disabled=(trip_type == "oneway"),
+                help="單程票不需填寫",
+                key="return_date_input",
+            )
+
         with st.form("add_task_form"):
             col1, col2 = st.columns(2)
             with col1:
                 origin = st.selectbox("出發地 (IATA)", AIRPORT_CODES, index=0)
             with col2:
                 destination = st.selectbox("目的地 (IATA)", AIRPORT_CODES, index=8)
-
-            trip_type = st.radio(
-                "行程類型",
-                options=["oneway", "roundtrip"],
-                format_func=lambda x: "單程" if x == "oneway" else "來回",
-                horizontal=True,
-            )
-
-            today = date.today()
-            col_d1, col_d2 = st.columns(2)
-            with col_d1:
-                depart_date = st.date_input(
-                    "出發日期",
-                    value=today + timedelta(days=30),
-                    min_value=today,
-                )
-            with col_d2:
-                return_date = st.date_input(
-                    "回程日期",
-                    value=today + timedelta(days=37),
-                    min_value=today,
-                    disabled=(trip_type == "oneway"),
-                    help="單程票不需填寫",
-                )
 
             submitted = st.form_submit_button("🚀 開始監控", use_container_width=True)
 
@@ -587,26 +628,34 @@ def main():
                 if st.button("📋 分享連結", use_container_width=True):
                     st.code(f"?task_id={shared_task_id}")
 
-            prices = get_latest_two_prices(shared_task_id)
-            if prices:
-                latest = prices[0]
-                prev = prices[1] if len(prices) > 1 else None
-                prev_price = prev["price_twd"] if prev else None
-                delta = (latest["price_twd"] - prev_price) if prev_price else 0
+            latest_list, prev_list = get_latest_prices(shared_task_id)
+            if latest_list:
+                best = latest_list[0]
+                prev_best_price = prev_list[0]["price_twd"] if prev_list else None
+                delta = (best["price_twd"] - prev_best_price) if prev_best_price else 0
 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric(
-                    "最新票價 (TWD)",
-                    f"NT${latest['price_twd']:,}",
-                    delta=f"{delta:+,}" if prev_price else None,
+                    "最新最低票價 (TWD)",
+                    f"NT${best['price_twd']:,}",
+                    delta=f"{delta:+,}" if prev_best_price else None,
                     delta_color="inverse",
                 )
                 m2.metric("行程類型", trip_label)
-                m3.metric("航空公司", latest["airline"] or "-")
-                m4.metric("轉機資訊", latest["layover_info"] or "-")
+                m3.metric("最低價航空", best["airline"] or "-")
+                m4.metric("轉機資訊", best["layover_info"] or "-")
 
-                st.info(price_comment(latest["price_twd"], prev_price))
-                st.caption(f"查詢時間：{latest['checked_at']}")
+                st.info(price_comment(best["price_twd"], prev_best_price))
+                st.caption(f"查詢時間：{best['checked_at']}")
+
+                # All airlines table
+                st.subheader("✈ 本次查詢所有航空公司")
+                df_airlines = pd.DataFrame([{
+                    "航空公司": f["airline"],
+                    "票價 (TWD)": f"NT${f['price_twd']:,}",
+                    "轉機資訊": f["layover_info"],
+                } for f in latest_list])
+                st.dataframe(df_airlines, use_container_width=True, hide_index=True)
             else:
                 st.warning("尚無查詢資料，點擊「立即查詢」開始抓取。")
 
