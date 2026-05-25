@@ -563,7 +563,7 @@ def main():
             return_date = st.date_input(
                 "回程日期",
                 value=today + timedelta(days=37),
-                min_value=depart_date + timedelta(days=1),
+                min_value=today,
                 disabled=(trip_type == "oneway"),
                 help="單程票不需填寫",
                 key="return_date_input",
@@ -725,4 +725,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
