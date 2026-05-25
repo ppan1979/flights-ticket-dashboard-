@@ -13,7 +13,7 @@ import threading
 import random
 import string
 import time
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -42,14 +42,26 @@ def init_db():
     with get_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
-                task_id     TEXT PRIMARY KEY,
-                origin      TEXT NOT NULL,
-                destination TEXT NOT NULL,
-                travel_date TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
+                task_id      TEXT PRIMARY KEY,
+                origin       TEXT NOT NULL,
+                destination  TEXT NOT NULL,
+                depart_date  TEXT NOT NULL,
+                return_date  TEXT,
+                trip_type    TEXT NOT NULL DEFAULT 'oneway',
+                created_at   TEXT NOT NULL,
                 last_checked TEXT
             )
         """)
+        # Migrate existing DB: add new columns if absent
+        existing = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "depart_date" not in existing and "travel_date" in existing:
+            conn.execute("ALTER TABLE tasks ADD COLUMN depart_date TEXT")
+            conn.execute("UPDATE tasks SET depart_date = travel_date WHERE depart_date IS NULL")
+        if "return_date" not in existing:
+            conn.execute("ALTER TABLE tasks ADD COLUMN return_date TEXT")
+        if "trip_type" not in existing:
+            conn.execute("ALTER TABLE tasks ADD COLUMN trip_type TEXT DEFAULT 'oneway'")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,13 +80,22 @@ def generate_task_id(length=6):
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
-def create_task(origin: str, destination: str, travel_date: str) -> str:
+def create_task(
+    origin: str,
+    destination: str,
+    depart_date: str,
+    return_date: Optional[str],
+    trip_type: str,
+) -> str:
     task_id = generate_task_id()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO tasks (task_id, origin, destination, travel_date, created_at) VALUES (?, ?, ?, ?, ?)",
-            (task_id, origin.upper(), destination.upper(), travel_date, now)
+            """INSERT INTO tasks
+               (task_id, origin, destination, depart_date, return_date, trip_type, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (task_id, origin.upper(), destination.upper(),
+             depart_date, return_date, trip_type, now)
         )
         conn.commit()
     return task_id
@@ -131,38 +152,48 @@ def price_comment(current: int, previous: Optional[int]) -> str:
         return "➡ 價格與上次相同，持續觀望中。"
 
 
+def format_date_range(task) -> str:
+    """Format depart / return dates for display."""
+    try:
+        depart = task["depart_date"]
+        trip_type = task["trip_type"] if task["trip_type"] else "oneway"
+        if trip_type == "roundtrip" and task["return_date"]:
+            return f"{depart} ~ {task['return_date']}"
+        return depart
+    except Exception:
+        return "-"
+
+
 # =============================================================================
-# PLAYWRIGHT SCRAPER
+# PLAYWRIGHT SCRAPER (simulation fallback)
 # =============================================================================
 
-async def fetch_flight_data(origin: str, destination: str, date: str) -> dict:
+async def fetch_flight_data(
+    origin: str,
+    destination: str,
+    depart_date: str,
+    return_date: Optional[str] = None,
+    trip_type: str = "oneway",
+) -> dict:
     """
     Headless Chromium scraper targeting Google Flights.
-    Returns dict: {airline, price_twd, layover_info}
-
-    Note: Google Flights DOM selectors may change over time.
-    This implementation targets the current (2025-2026) layout.
-    If scraping fails, falls back to a simulated result for dev/demo purposes.
+    Falls back to simulated data if scraping fails.
     """
-    result = {
-        "airline": "N/A",
-        "price_twd": 0,
-        "layover_info": "N/A",
-    }
+    result = {"airline": "N/A", "price_twd": 0, "layover_info": "N/A"}
 
-    url = (
-        f"https://www.google.com/travel/flights/search"
-        f"?tfs=CBwQAhooagcIARIDe3tvcmlnaW59EgN7e2Rlc3R9fQoGCAESA3t7ZGF0ZX19"
-        f"&hl=zh-TW&curr=TWD"
-    )
-
-    # Build a clean direct URL instead of templating the encrypted tfs
-    # Use the simpler query format
-    clean_url = (
-        f"https://www.google.com/travel/flights?"
-        f"hl=zh-TW&curr=TWD"
-        f"#flt={origin}.{destination}.{date};c:TWD;e:1;s:0*1;sd:1;t:f"
-    )
+    if trip_type == "roundtrip" and return_date:
+        clean_url = (
+            f"https://www.google.com/travel/flights?"
+            f"hl=zh-TW&curr=TWD"
+            f"#flt={origin}.{destination}.{depart_date}*{destination}.{origin}.{return_date}"
+            f";c:TWD;e:1;s:0*1;sd:1;t:r"
+        )
+    else:
+        clean_url = (
+            f"https://www.google.com/travel/flights?"
+            f"hl=zh-TW&curr=TWD"
+            f"#flt={origin}.{destination}.{depart_date};c:TWD;e:1;s:0*1;sd:1;t:f"
+        )
 
     try:
         async with async_playwright() as p:
@@ -183,65 +214,45 @@ async def fetch_flight_data(origin: str, destination: str, date: str) -> dict:
                 ),
                 locale="zh-TW",
             )
-
             page = await context.new_page()
-
-            # Remove automation hints
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """)
-
+            await page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
             await page.goto(clean_url, timeout=30000)
-
-            # Random human-like wait after page load
             await asyncio.sleep(random.uniform(3.5, 6.5))
 
-            # Wait for flight results container
             try:
                 await page.wait_for_selector('[data-ved]', timeout=15000)
             except Exception:
                 pass
-
-            # Extra random delay to mimic reading
             await asyncio.sleep(random.uniform(1.5, 3.0))
 
-            # --- Extract cheapest flight ---
-            # Google Flights best flights section
-            # Try multiple selector strategies
             price_text = None
             airline_text = None
             layover_raw = None
 
-            # Strategy 1: structured flight list items
             try:
                 cards = await page.query_selector_all('li[data-ved]')
                 if cards:
                     card = cards[0]
-
-                    # Price
                     price_el = await card.query_selector('[data-isin]')
                     if price_el:
                         price_text = await price_el.inner_text()
-
-                    # Airline
                     airline_el = await card.query_selector('.sSHqwe')
                     if airline_el:
                         airline_text = await airline_el.inner_text()
-
-                    # Stops/layover
                     stop_el = await card.query_selector('.EfT7Ae .ogfYpf')
                     if stop_el:
                         layover_raw = await stop_el.inner_text()
             except Exception:
                 pass
 
-            # Strategy 2: generic price spans
             if not price_text:
                 try:
                     spans = await page.query_selector_all('span[data-gs]')
                     for span in spans[:5]:
                         txt = await span.inner_text()
-                        if "TWD" in txt or "$" in txt or any(c.isdigit() for c in txt):
+                        if any(c.isdigit() for c in txt):
                             price_text = txt
                             break
                 except Exception:
@@ -249,18 +260,14 @@ async def fetch_flight_data(origin: str, destination: str, date: str) -> dict:
 
             await browser.close()
 
-            # --- Parse price ---
             price_twd = 0
             if price_text:
                 digits = "".join(c for c in price_text if c.isdigit())
                 if digits:
                     price_twd = int(digits)
 
-            # --- Parse airline ---
-            airline = airline_text.strip() if airline_text else "不明航空"
-
-            # --- Parse layover ---
             layover_info = _parse_layover(layover_raw)
+            airline = airline_text.strip() if airline_text else "不明航空"
 
             if price_twd > 0:
                 result = {
@@ -270,42 +277,39 @@ async def fetch_flight_data(origin: str, destination: str, date: str) -> dict:
                 }
 
     except Exception as exc:
-        # Scraping failed - return simulated data for demo/dev
         st.warning(f"爬蟲發生錯誤（{exc}），使用模擬資料示範流程。")
-        result = _simulate_flight_data(origin, destination)
+        result = _simulate_flight_data(origin, destination, trip_type)
 
     return result
 
 
 def _parse_layover(raw: Optional[str]) -> str:
-    """Parse Google Flights stop text into readable layover string."""
     if not raw:
         return "直飛"
     raw = raw.strip().lower()
     if "nonstop" in raw or "直飛" in raw or raw == "0":
         return "直飛"
-
-    # e.g. "1 stop" / "2 stops" / "1次轉機 HKG 2小時15分"
-    # Return raw cleaned if it is already informative
-    return raw.strip() if raw else "直飛"
+    return raw.strip()
 
 
-def _simulate_flight_data(origin: str, destination: str) -> dict:
-    """Demo fallback when scraping is unavailable."""
+def _simulate_flight_data(origin: str, destination: str, trip_type: str = "oneway") -> dict:
     airlines = ["中華航空", "長榮航空", "國泰航空", "日本航空", "新加坡航空"]
     base_prices = {
-        ("TPE", "NRT"): 8500,
-        ("TPE", "HKG"): 4200,
-        ("TPE", "SIN"): 11000,
-        ("TPE", "BKK"): 9800,
-        ("TPE", "LHR"): 35000,
+        ("TPE", "NRT"): 8500,  ("TPE", "HKG"): 4200,
+        ("TPE", "SIN"): 11000, ("TPE", "BKK"): 9800,
+        ("TPE", "LHR"): 35000, ("TPE", "ICN"): 6500,
     }
-    layovers = ["直飛", "1次 (HKG / 1小時30分)", "1次 (NRT / 2小時)", "2次 (HKG / 1小時, SIN / 3小時)"]
-
+    layovers = [
+        "直飛",
+        "1次 (HKG / 1小時30分)",
+        "1次 (NRT / 2小時)",
+        "2次 (HKG / 1小時, SIN / 3小時)",
+    ]
     key = (origin.upper(), destination.upper())
     base = base_prices.get(key, 15000)
-    price = base + random.randint(-2000, 2000)
-
+    # Round-trip price roughly doubles with small discount
+    multiplier = 1.85 if trip_type == "roundtrip" else 1.0
+    price = int((base + random.randint(-2000, 2000)) * multiplier)
     return {
         "airline": random.choice(airlines),
         "price_twd": price,
@@ -314,20 +318,22 @@ def _simulate_flight_data(origin: str, destination: str) -> dict:
 
 
 def run_fetch_for_task(task_id: str):
-    """Synchronous wrapper called by scheduler or Streamlit button."""
     task = get_task(task_id)
     if not task:
         return
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        # Support both old (travel_date) and new (depart_date) schema
+        depart = task["depart_date"] if task["depart_date"] else task["travel_date"] if "travel_date" in task.keys() else ""
+        return_d = task["return_date"] if task["return_date"] else None
+        trip_type = task["trip_type"] if task["trip_type"] else "oneway"
         data = loop.run_until_complete(
-            fetch_flight_data(task["origin"], task["destination"], task["travel_date"])
+            fetch_flight_data(task["origin"], task["destination"],
+                              depart, return_d, trip_type)
         )
     finally:
         loop.close()
-
     if data and data["price_twd"] > 0:
         save_price(task_id, data["airline"], data["price_twd"], data["layover_info"])
 
@@ -346,8 +352,7 @@ def start_scheduler():
     _scheduler_started = True
 
     def job():
-        tasks = get_all_tasks()
-        for task in tasks:
+        for task in get_all_tasks():
             run_fetch_for_task(task["task_id"])
 
     scheduler = BackgroundScheduler()
@@ -356,7 +361,6 @@ def start_scheduler():
 
 
 def _start_in_thread():
-    """Start scheduler inside a Streamlit-aware thread."""
     t = threading.Thread(target=start_scheduler, daemon=True)
     add_script_run_ctx(t)
     t.start()
@@ -367,17 +371,20 @@ def _start_in_thread():
 # =============================================================================
 
 def build_dashboard_df() -> pd.DataFrame:
-    tasks = get_all_tasks()
     rows = []
-    for task in tasks:
+    for task in get_all_tasks():
         tid = task["task_id"]
         prices = get_latest_two_prices(tid)
+        trip_type = task["trip_type"] if task["trip_type"] else "oneway"
+        trip_label = "來回" if trip_type == "roundtrip" else "單程"
 
         if not prices:
             rows.append({
                 "task_id": tid,
                 "航線": f"{task['origin']} → {task['destination']}",
-                "出發日期": task["travel_date"],
+                "行程類型": trip_label,
+                "出發日期": task["depart_date"] or "-",
+                "回程日期": task["return_date"] or "-",
                 "航空公司": "-",
                 "轉機資訊": "-",
                 "最新價格 (TWD)": None,
@@ -389,56 +396,58 @@ def build_dashboard_df() -> pd.DataFrame:
 
         latest = prices[0]
         prev = prices[1] if len(prices) > 1 else None
-
-        current_price = latest["price_twd"]
         prev_price = prev["price_twd"] if prev else None
-        delta = (current_price - prev_price) if prev_price is not None else None
+        delta = (latest["price_twd"] - prev_price) if prev_price is not None else None
 
         rows.append({
             "task_id": tid,
             "航線": f"{task['origin']} → {task['destination']}",
-            "出發日期": task["travel_date"],
+            "行程類型": trip_label,
+            "出發日期": task["depart_date"] or "-",
+            "回程日期": task["return_date"] or "-",
             "航空公司": latest["airline"] or "-",
             "轉機資訊": latest["layover_info"] or "-",
-            "最新價格 (TWD)": current_price,
+            "最新價格 (TWD)": latest["price_twd"],
             "上次價格 (TWD)": prev_price,
             "變動幅度": delta,
-            "智能評論": price_comment(current_price, prev_price),
+            "智能評論": price_comment(latest["price_twd"], prev_price),
         })
 
     return pd.DataFrame(rows)
 
 
-def style_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_df(df: pd.DataFrame):
     display_cols = [c for c in df.columns if c != "task_id"]
     display_df = df[display_cols].copy()
 
     def highlight_drop(row):
-        styles = [""] * len(row)
         try:
             idx = display_cols.index("變動幅度")
             val = row.iloc[idx]
             if pd.notna(val) and val < 0:
-                styles = [
-                    "background-color: #d4edda; color: #155724;" if c in ("最新價格 (TWD)", "變動幅度", "智能評論")
+                return [
+                    "background-color: #d4edda; color: #155724;"
+                    if c in ("最新價格 (TWD)", "變動幅度", "智能評論")
                     else "background-color: #f0fbf2;"
                     for c in display_cols
                 ]
         except (ValueError, IndexError):
             pass
-        return styles
+        return [""] * len(display_cols)
 
-    styler = display_df.style.apply(highlight_drop, axis=1)
-    styler = styler.format({
-        "最新價格 (TWD)": lambda x: f"NT${x:,.0f}" if pd.notna(x) else "-",
-        "上次價格 (TWD)": lambda x: f"NT${x:,.0f}" if pd.notna(x) else "-",
-        "變動幅度": lambda x: f"{x:+,.0f}" if pd.notna(x) else "-",
-    })
-    return styler
+    return (
+        display_df.style
+        .apply(highlight_drop, axis=1)
+        .format({
+            "最新價格 (TWD)": lambda x: f"NT${x:,.0f}" if pd.notna(x) else "-",
+            "上次價格 (TWD)": lambda x: f"NT${x:,.0f}" if pd.notna(x) else "-",
+            "變動幅度": lambda x: f"{x:+,.0f}" if pd.notna(x) else "-",
+        })
+    )
 
 
 # =============================================================================
-# UI HELPERS
+# AIRPORT LIST
 # =============================================================================
 
 AIRPORT_CODES = [
@@ -468,18 +477,10 @@ def main():
     init_db()
     _start_in_thread()
 
-    # --- Custom CSS ---
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;600;700&display=swap');
     html, body, [class*="css"] { font-family: 'Noto Sans TC', sans-serif; }
-    .metric-card {
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        border-radius: 12px;
-        padding: 16px 20px;
-        color: #e0e0e0;
-        border-left: 4px solid #0f3460;
-    }
     .task-badge {
         display: inline-block;
         background: #0f3460;
@@ -494,17 +495,15 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # --- Header ---
     st.title("✈ 多航點機票即時監控系統")
     st.caption("免註冊 · 免登入 · 24小時自動追蹤 · Powered by Playwright")
     st.divider()
 
-    # --- Query params for shared task view ---
     params = st.query_params
     shared_task_id = params.get("task_id", None)
 
     # ==========================================================================
-    # SIDEBAR: Add new task
+    # SIDEBAR
     # ==========================================================================
     with st.sidebar:
         st.header("➕ 新增監控任務")
@@ -516,18 +515,42 @@ def main():
             with col2:
                 destination = st.selectbox("目的地 (IATA)", AIRPORT_CODES, index=8)
 
-            travel_date = st.date_input("出發日期", min_value=datetime.today())
+            trip_type = st.radio(
+                "行程類型",
+                options=["oneway", "roundtrip"],
+                format_func=lambda x: "單程" if x == "oneway" else "來回",
+                horizontal=True,
+            )
+
+            today = date.today()
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                depart_date = st.date_input(
+                    "出發日期",
+                    value=today + timedelta(days=30),
+                    min_value=today,
+                )
+            with col_d2:
+                return_date = st.date_input(
+                    "回程日期",
+                    value=today + timedelta(days=37),
+                    min_value=today,
+                    disabled=(trip_type == "oneway"),
+                    help="單程票不需填寫",
+                )
+
             submitted = st.form_submit_button("🚀 開始監控", use_container_width=True)
 
             if submitted:
                 if origin == destination:
                     st.error("出發地與目的地不能相同！")
+                elif trip_type == "roundtrip" and return_date <= depart_date:
+                    st.error("回程日期必須晚於出發日期！")
                 else:
-                    date_str = travel_date.strftime("%Y-%m-%d")
-                    new_id = create_task(origin, destination, date_str)
+                    d_str = depart_date.strftime("%Y-%m-%d")
+                    r_str = return_date.strftime("%Y-%m-%d") if trip_type == "roundtrip" else None
+                    new_id = create_task(origin, destination, d_str, r_str, trip_type)
                     st.success(f"任務已建立！task_id: `{new_id}`")
-                    st.info("系統將在背景自動抓取資料，或點擊下方「立即查詢」手動觸發。")
-                    # Auto-fetch once immediately in thread
                     t = threading.Thread(target=run_fetch_for_task, args=(new_id,), daemon=True)
                     add_script_run_ctx(t)
                     t.start()
@@ -540,29 +563,32 @@ def main():
         st.caption("分享網址格式：?task_id=xxxxxx")
 
     # ==========================================================================
-    # SINGLE TASK VIEW (shared link)
+    # SINGLE TASK VIEW
     # ==========================================================================
     if shared_task_id:
         task = get_task(shared_task_id)
         if task:
+            trip_type = task["trip_type"] if task["trip_type"] else "oneway"
+            trip_label = "來回" if trip_type == "roundtrip" else "單程"
+            depart = task["depart_date"] or "-"
+            ret = task["return_date"] or "-"
+            date_display = f"{depart} ~ {ret}" if trip_type == "roundtrip" else depart
+
             st.subheader(
-                f"📌 任務詳情：{task['origin']} → {task['destination']}"
+                f"📌 {trip_label} | {task['origin']} ⇄ {task['destination']} "
                 f"<span class='task-badge'>{shared_task_id}</span>",
                 anchor=False,
             )
-            st.markdown(
-                f"出發日期：**{task['travel_date']}** ｜ 建立時間：{task['created_at']}",
-                unsafe_allow_html=False,
-            )
+            st.markdown(f"日期：**{date_display}** ｜ 建立時間：{task['created_at']}")
 
-            col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 4])
+            col_btn1, col_btn2, _ = st.columns([1, 1, 4])
             with col_btn1:
                 if st.button("🔄 立即查詢", use_container_width=True):
-                    with st.spinner("正在爬取最新資料..."):
+                    with st.spinner("正在抓取最新資料..."):
                         run_fetch_for_task(shared_task_id)
                     st.rerun()
             with col_btn2:
-                if st.button("📋 複製分享連結", use_container_width=True):
+                if st.button("📋 分享連結", use_container_width=True):
                     st.code(f"?task_id={shared_task_id}")
 
             prices = get_latest_two_prices(shared_task_id)
@@ -570,20 +596,20 @@ def main():
                 latest = prices[0]
                 prev = prices[1] if len(prices) > 1 else None
                 prev_price = prev["price_twd"] if prev else None
-                comment = price_comment(latest["price_twd"], prev_price)
                 delta = (latest["price_twd"] - prev_price) if prev_price else 0
 
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric(
                     "最新票價 (TWD)",
                     f"NT${latest['price_twd']:,}",
                     delta=f"{delta:+,}" if prev_price else None,
                     delta_color="inverse",
                 )
-                m2.metric("航空公司", latest["airline"] or "-")
-                m3.metric("轉機資訊", latest["layover_info"] or "-")
+                m2.metric("行程類型", trip_label)
+                m3.metric("航空公司", latest["airline"] or "-")
+                m4.metric("轉機資訊", latest["layover_info"] or "-")
 
-                st.info(comment)
+                st.info(price_comment(latest["price_twd"], prev_price))
                 st.caption(f"查詢時間：{latest['checked_at']}")
             else:
                 st.warning("尚無查詢資料，點擊「立即查詢」開始抓取。")
@@ -595,50 +621,51 @@ def main():
                     "SELECT checked_at AS '查詢時間', airline AS '航空公司', "
                     "price_twd AS '票價 (TWD)', layover_info AS '轉機資訊' "
                     "FROM price_history WHERE task_id = ? ORDER BY checked_at DESC",
-                    conn,
-                    params=(shared_task_id,),
+                    conn, params=(shared_task_id,),
                 )
             if not hist.empty:
                 st.dataframe(hist, use_container_width=True, hide_index=True)
             else:
                 st.caption("暫無歷史紀錄。")
-
             st.divider()
 
         else:
             st.error(f"找不到 task_id = `{shared_task_id}` 的任務。")
 
     # ==========================================================================
-    # MAIN DASHBOARD: All tasks table
+    # MAIN DASHBOARD
     # ==========================================================================
     st.subheader("📊 全部監控任務總覽")
 
-    col_refresh, col_info = st.columns([1, 5])
-    with col_refresh:
+    col_ref, col_info = st.columns([1, 5])
+    with col_ref:
         if st.button("🔄 重新整理", use_container_width=True):
             st.rerun()
     with col_info:
-        st.caption("降價儲存格自動標示淺綠色 ✅ ｜點選任務 ID 欄位的連結可複製分享網址")
+        st.caption("降價列自動標示淺綠色 ✅ ｜ 來回票價為去程＋回程合計")
 
     df = build_dashboard_df()
 
     if df.empty:
         st.info("目前沒有監控任務。請在左側側欄新增第一筆！")
     else:
-        # Show task links
         with st.expander("🔗 各任務分享連結", expanded=False):
             for _, row in df.iterrows():
-                st.code(f"?task_id={row['task_id']}  |  {row['航線']}  {row['出發日期']}")
+                label = f"{row['航線']}  {row['出發日期']}"
+                if row["回程日期"] != "-":
+                    label += f" ~ {row['回程日期']}"
+                st.code(f"?task_id={row['task_id']}  |  {label}")
 
-        styler = style_df(df)
-        st.dataframe(styler, use_container_width=True, hide_index=True, height=420)
+        st.dataframe(style_df(df), use_container_width=True, hide_index=True, height=420)
 
-        # Manual fetch all
-        if st.button("⚡ 立即全部更新 (手動觸發爬蟲)", use_container_width=False):
+        if st.button("⚡ 立即全部更新"):
             prog = st.progress(0, text="正在更新...")
             tasks = get_all_tasks()
             for i, task in enumerate(tasks):
-                prog.progress((i + 1) / len(tasks), text=f"查詢 {task['origin']} → {task['destination']}...")
+                prog.progress(
+                    (i + 1) / len(tasks),
+                    text=f"查詢 {task['origin']} → {task['destination']}..."
+                )
                 run_fetch_for_task(task["task_id"])
             prog.empty()
             st.success("全部更新完成！")
