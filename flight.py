@@ -40,28 +40,66 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id      TEXT PRIMARY KEY,
-                origin       TEXT NOT NULL,
-                destination  TEXT NOT NULL,
-                depart_date  TEXT NOT NULL,
-                return_date  TEXT,
-                trip_type    TEXT NOT NULL DEFAULT 'oneway',
-                created_at   TEXT NOT NULL,
-                last_checked TEXT
-            )
-        """)
-        # Migrate existing DB: add new columns if absent
-        existing = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
-        if "depart_date" not in existing and "travel_date" in existing:
-            conn.execute("ALTER TABLE tasks ADD COLUMN depart_date TEXT")
-            conn.execute("UPDATE tasks SET depart_date = travel_date WHERE depart_date IS NULL")
-        if "return_date" not in existing:
-            conn.execute("ALTER TABLE tasks ADD COLUMN return_date TEXT")
-        if "trip_type" not in existing:
-            conn.execute("ALTER TABLE tasks ADD COLUMN trip_type TEXT DEFAULT 'oneway'")
+        # ---------------------------------------------------------------
+        # Check existing tasks table schema
+        # ---------------------------------------------------------------
+        existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
 
+        if existing_cols and "depart_date" not in existing_cols:
+            # Old schema detected (has travel_date, missing new columns).
+            # Rename old table, recreate with new schema, copy data over.
+            conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+            conn.execute("""
+                CREATE TABLE tasks (
+                    task_id      TEXT PRIMARY KEY,
+                    origin       TEXT NOT NULL,
+                    destination  TEXT NOT NULL,
+                    depart_date  TEXT NOT NULL DEFAULT '',
+                    return_date  TEXT,
+                    trip_type    TEXT NOT NULL DEFAULT 'oneway',
+                    created_at   TEXT NOT NULL,
+                    last_checked TEXT
+                )
+            """)
+            # Copy old rows; map travel_date -> depart_date
+            old_cols = existing_cols  # e.g. [task_id, origin, destination, travel_date, created_at, last_checked]
+            travel_col = "travel_date" if "travel_date" in old_cols else "depart_date"
+            conn.execute(f"""
+                INSERT INTO tasks (task_id, origin, destination, depart_date, return_date, trip_type, created_at, last_checked)
+                SELECT task_id, origin, destination,
+                       COALESCE({travel_col}, ''),
+                       NULL,
+                       'oneway',
+                       created_at,
+                       last_checked
+                FROM tasks_old
+            """)
+            conn.execute("DROP TABLE tasks_old")
+
+        elif not existing_cols:
+            # Fresh install
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id      TEXT PRIMARY KEY,
+                    origin       TEXT NOT NULL,
+                    destination  TEXT NOT NULL,
+                    depart_date  TEXT NOT NULL DEFAULT '',
+                    return_date  TEXT,
+                    trip_type    TEXT NOT NULL DEFAULT 'oneway',
+                    created_at   TEXT NOT NULL,
+                    last_checked TEXT
+                )
+            """)
+        else:
+            # Schema already up to date; ensure optional columns exist
+            if "return_date" not in existing_cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN return_date TEXT")
+            if "trip_type" not in existing_cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN trip_type TEXT NOT NULL DEFAULT 'oneway'")
+
+        # ---------------------------------------------------------------
+        # price_history table (unchanged schema)
+        # ---------------------------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
