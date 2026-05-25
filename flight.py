@@ -40,20 +40,14 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
-        # ------------------------------------------------------------------
-        # tasks table: drop and recreate when schema is missing any column
-        # ------------------------------------------------------------------
-        task_col_rows = conn.execute("PRAGMA table_info(tasks)").fetchall()
-        task_cols = {r[1] for r in task_col_rows}
-        required = {"task_id", "origin", "destination", "depart_date",
-                    "return_date", "trip_type", "created_at", "last_checked"}
-
-        if task_cols and not required.issubset(task_cols):
-            # Incompatible old schema -- drop and rebuild cleanly.
+        # Always drop tasks if the old travel_date column exists.
+        # This is a one-time cleanup for legacy deployments.
+        old_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "travel_date" in old_cols:
             conn.execute("DROP TABLE IF EXISTS tasks")
-            task_cols = set()
+            old_cols = set()
 
-        if not task_cols:
+        if not old_cols:
             conn.execute("""
                 CREATE TABLE tasks (
                     task_id      TEXT PRIMARY KEY,
@@ -67,9 +61,6 @@ def init_db():
                 )
             """)
 
-        # ------------------------------------------------------------------
-        # price_history table: schema unchanged, safe to keep
-        # ------------------------------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -685,4 +676,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
